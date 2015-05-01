@@ -82,7 +82,7 @@ class EgnyteClient(base.Session):
 
     def get(self, path):
         """Check whether a path is a file or a folder and return the right object."""
-        return self.folder(path)._get()
+        return self.folder(path).get()
 
     def impersonate(self, username):
         """
@@ -99,7 +99,7 @@ class EgnyteClient(base.Session):
         self._session.headers.pop('X-Egnyte-Act-As', None)
         self._session.headers.pop('X-Egnyte-Act-As-Email', None)
 
-    def bulk_upload(self, paths, target, exclude=None, progress_callbacks=None):
+    def bulk_upload(self, paths, target, threads=2, chunksize_mb=100, exclude=None, progress_callbacks=None):
         """
         Transfer many files or directories to Cloud File System.
 
@@ -125,7 +125,7 @@ class EgnyteClient(base.Session):
                     cloud_file = target_folder.file(cloud_path, size=size)
                     with open(local_path, "rb") as fp:
                         progress_callbacks.upload_start(local_path, cloud_file, size)
-                        cloud_file.upload(fp, size, progress_callbacks.upload_progress)
+                        cloud_file.upload(fp, size=size, threads=threads, chunksize_mb=chunksize_mb, progress_callback=progress_callbacks.upload_progress)
                     progress_callbacks.upload_finish(cloud_file)
         progress_callbacks.finished()
 

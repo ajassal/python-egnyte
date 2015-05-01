@@ -1,11 +1,14 @@
 from __future__ import unicode_literals
 
 import collections
+import threading
 
 import six
+import requests
 
 from egnyte import base, exc
 
+MEGABYTES = (1024 * 1024)  # 1 MB
 
 class FileOrFolder(base.Resource):
     """Things that are common to both files and folders."""
@@ -48,7 +51,7 @@ class FileOrFolder(base.Resource):
                                           copy_me=copy_me, notify=notify, link_to_current=link_to_current,
                                           expiry_date=expiry_date, expiry_clicks=expiry_clicks, add_filename=add_filename)
 
-    def _get(self):
+    def get(self):
         """Get the right object type (File or Folder), depending on what this path points to in the Cloud File System"""
         json = exc.default.check_json_response(self._client.GET(self._url))
         if json['is_folder'] and not isinstance(self, Folder):
@@ -70,7 +73,7 @@ class File(FileOrFolder):
     Does not have to exist - this can represent a new file to be uploaded.
     path - file path
     """
-    _upload_chunk_size = 100 * (1024 * 1024)  # 100 MB
+    _upload_chunk_threshold = 100*MEGABYTES
     _upload_retries = 3
     _link_kind = 'file'
     _lazy_attributes = {'num_versions', 'name', 'checksum', 'last_modified', 'entry_id',
@@ -78,7 +81,7 @@ class File(FileOrFolder):
     _url_template_content = "pubapi/v1/fs-content%(path)s"
     _url_template_content_chunked = "pubapi/v1/fs-content-chunked%(path)s"
 
-    def upload(self, fp, size=None, progress_callback=None):
+    def upload(self, fp, threads=2, chunksize_mb=100, size=None, progress_callback=None):
         """
         Upload file contents.
         fp can be any file-like object, but if you don't specify it's size in advance it must support tell and seek methods.
@@ -88,24 +91,27 @@ class File(FileOrFolder):
             fp = six.BytesIO(fp)
         if size is None:
             size = base.get_file_size(fp)
-        if size < self._upload_chunk_size:
+        if size < self._upload_chunk_threshold:
             # simple, one request upload
             retries = max(self._upload_retries, 1)
             while retries > 0:
                 url = self._client.get_url(self._url_template_content, path=self.path)
                 chunk = base._FileChunk(fp, 0, size)
-                r = self._client.POST(url, data=chunk, headers={'Content-length': size})
-                exc.default.check_response(r)
-                server_sha = r.headers['X-Sha512-Checksum']
-                our_sha = chunk.sha.hexdigest()
-                if server_sha == our_sha:
-                    break
+                try:
+                    r = self._client.POST(url, data=chunk, headers={'Content-length': size})
+                    exc.default.check_response(r)
+                    server_sha = r.headers['X-Sha512-Checksum']
+                    our_sha = chunk.sha.hexdigest()
+                    if server_sha == our_sha:
+                        break
+                except requests.ConnectionError as e:
+                    print('retrying on error: %s' % e)
                 retries -= 1
                 # TODO: retry network errors too
             if retries == 0:
                 raise exc.ChecksumError("Failed to upload file", {})
         else:  # chunked upload
-            return self._chunked_upload(fp, size, progress_callback)
+            return self._chunked_upload(fp, size, threads, chunksize_mb, progress_callback)
 
     def download(self, download_range=None):
         """
@@ -122,33 +128,55 @@ class File(FileOrFolder):
             r = exc.partial.check_response(self._client.GET(url, stream=True, headers={'Range': 'bytes=%d-%d' % download_range}))
         return base.FileDownload(r, self)
 
-    def _chunked_upload(self, fp, size, progress_callback):
-        url = self._client.get_url(self._url_template_content_chunked, path=self.path)
-        chunks = list(base.split_file_into_chunks(fp, size, self._upload_chunk_size))  # need count of chunks
-        chunk_count = len(chunks)
+    def _upload_single_chunk(self, url, chunk_number, chunk, size, chunksize_mb, progress_callback, is_last_chunk=False, upload_id=None):
         headers = {}
-        for chunk_number, chunk in enumerate(chunks, 1):  # count from 1 not 0
-            headers['x-egnyte-chunk-num'] = "%d" % chunk_number
-            headers['content-length'] = chunk.size
-            if chunk_number == chunk_count:  # last chunk
-                headers['x-egnyte-last-chunk'] = "true"
-            retries = max(self._upload_retries, 1)
-            while retries > 0:
-                r = self._client.POST(url, data=chunk, headers=headers)
-                server_sha = r.headers['x-egnyte-chunk-sha512-checksum']
-                our_sha = chunk.sha.hexdigest()
-                if server_sha == our_sha:
-                    break
-                retries -= 1
-                # TODO: retry network errors too
-                # TODO: refactor common parts of chunked and standard upload
-            if retries == 0:
-                raise exc.ChecksumError("Failed to upload file chunk", {"chunk_number": chunk_number, "start_position": chunk.position})
-            exc.default.check_response(r)
-            if chunk_number == 1:
-                headers['x-egnyte-upload-id'] = r.headers['x-egnyte-upload-id']
-            if progress_callback is not None:
-                progress_callback(self, size, chunk_number * self._upload_chunk_size)
+        headers['x-egnyte-chunk-num'] = "%d" % chunk_number
+        headers['content-length'] = chunk.size
+        if is_last_chunk:
+            headers['x-egnyte-last-chunk'] = "true"
+        if upload_id:
+            headers['x-egnyte-upload-id'] = upload_id
+        retries = max(self._upload_retries, 1)
+        while retries > 0:
+            r = self._client.POST(url, data=chunk, headers=headers)
+            server_sha = r.headers['x-egnyte-chunk-sha512-checksum']
+            our_sha = chunk.sha.hexdigest()
+            if server_sha == our_sha:
+                break
+            retries -= 1
+            # TODO: retry network errors too
+            # TODO: refactor common parts of chunked and standard upload
+        if retries == 0:
+            raise exc.ChecksumError("Failed to upload file chunk", {"chunk_number": chunk_number, "start_position": chunk.position})
+        exc.default.check_response(r)
+        if progress_callback is not None:
+            progress_callback(self, size, chunk_number * chunksize_mb*MEGABYTES)
+        return r.headers
+
+    def _chunked_upload(self, fp, size, threads, chunksize_mb, progress_callback):
+        url = self._client.get_url(self._url_template_content_chunked, path=self.path)
+        chunks = list(base.split_file_into_chunks(fp, size, chunksize_mb*MEGABYTES))  # need count of chunks
+        chunk_count = len(chunks)
+        # upload first chunk
+        chunk = chunks.pop()
+        headers = self._upload_single_chunk(url, 1, chunk, size, chunksize_mb, progress_callback, is_last_chunk=chunk_count==1)
+        upload_id = headers['x-egnyte-upload-id']
+        # upload intermediate chunks in separate threads
+        if chunk_count > 2:
+            n = 1
+            for chunk_slice in six.moves.zip_longest(*[iter(chunks[:-1])]*threads):
+                threads = []
+                for c in chunk_slice:
+                    if c:
+                        n += 1
+                        threads.append(threading.Thread(target=self._upload_single_chunk, args=(url, n, c, size, chunksize_mb, progress_callback), kwargs={'upload_id': upload_id}))
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+        # upload last chunk
+        if chunk_count > 1:
+            self._upload_single_chunk(url, chunk_count, chunks[-1], size, chunksize_mb, progress_callback, upload_id=upload_id, is_last_chunk=True)
 
     def delete(self):
         """Delete this file."""
@@ -201,7 +229,7 @@ class Folder(FileOrFolder):
         """
         Gets contents of this folder (in instance attributes 'folders' and 'files')
         """
-        return self._get()
+        return self.get()
 
     def get_permissions(self, users=None, groups=None):
         """

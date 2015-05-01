@@ -44,6 +44,11 @@ def create_main_parser():
     parser_test = subparsers.add_parser('test', help='test if config is correct (connects to service)', **parser_kwargs)
     parser_test.set_defaults(command='test')
 
+    parser_list = subparsers.add_parser('list', help='list resource', **parser_kwargs)
+    parser_list.set_defaults(command='list')
+
+    parser_list.add_argument('path', help='path to list')
+
     for parser, required in [(parser_config_create, True), (parser_config_update, False), (parser_token, False)]:
         parser.add_argument('-d', '--domain', required=required, help='domain name')
         parser.add_argument('-l', '--login', required=False, help='login')
@@ -103,6 +108,8 @@ def create_main_parser():
     parser_upload.add_argument('paths', nargs='+', help="Paths (files to directories) to upload")
     parser_upload.add_argument('target', help="Path in Cloud File System to upload to")
     parser_upload.add_argument('-x', '--exclude', action='append', default=None, help='Exclude items that match this glob pattern')
+    parser_upload.add_argument('-t', '--threads', required=False, default='2', help='Number of concurrent threads if size > 100MB')
+    parser_upload.add_argument('-c', '--chunksize_mb', required=False, default='100', help='Default chunk size if upload will be chunked')
 
     parser_download = subparsers.add_parser('download', help='download files from Egnyte', **parser_kwargs)
     parser_download.set_defaults(command="download")
@@ -128,10 +135,6 @@ def create_main_parser():
     parser_events.add_argument('--type', action='append', help="Limit to events of specific type", default=None)
     parser_events.add_argument('--folder', help="Limit to events in specific folder and it's subfolders", default=None)
     parser_events.add_argument('--suppress', help="Skip events caused by this app or user. Valid values: app, user.", default=None)
-
-
-
-
 
     return main
 
@@ -241,6 +244,13 @@ class Commands(object):
         info = api.user_info()
         print("Connection successful for user %s" % (info['username'],))
 
+    def cmd_list(self):
+        api = self.get_client()
+        path = getattr(self.args, 'path', None)
+        if path:
+            result = api.get(path).get()
+            self.print_json(result)
+
     def cmd_search(self):
         api = self.get_client()
         results = api.search.files(self.args.query, modified_before=self.args.mtime_to, modified_after=self.args.mtime_from, folder=self.args.folder)
@@ -329,7 +339,8 @@ class Commands(object):
 
     def cmd_upload(self):
         api = self.get_client()
-        api.bulk_upload(self.args.paths, self.args.target, self.args.exclude, self.transfer_callbacks())
+        api.bulk_upload(self.args.paths, self.args.target, threads=int(self.args.threads), chunksize_mb=int(self.args.chunksize_mb),
+                exclude=self.args.exclude, progress_callbacks=self.transfer_callbacks())
 
     def cmd_download(self):
         api = self.get_client()
